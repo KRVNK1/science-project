@@ -18,6 +18,7 @@ return new class extends Migration
             $table->text('abstract');
             $table->string('keywords');
             $table->text('content');
+            $table->text('references');
             $table->enum('status', ['draft', 'under_review', 'rejected', 'published'])->default('draft');
             $table->timestamps();
         });

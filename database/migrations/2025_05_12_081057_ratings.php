@@ -17,9 +17,6 @@ return new class extends Migration
             $table->foreignId('article_id')->constrained()->onDelete('cascade');
             $table->integer('rating')->comment('Оценка от 1 до 5');
             $table->timestamps();
-            
-            // Убедимся, что пользователь может оценить статью только один раз
-            $table->unique(['user_id', 'article_id']);
         });
     }
 

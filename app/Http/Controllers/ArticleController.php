@@ -4,137 +4,224 @@ namespace App\Http\Controllers;
 
 use App\Models\Article;
 use Illuminate\Http\Request;
+use Inertia\Inertia;
 use Illuminate\Support\Facades\Auth;
-use App\Models\User;
 
 class ArticleController extends Controller
 {
-    public function __construct()
+    // Страница всех статей
+    public function index(Request $request)
     {
-        // Используем метод middleware из базового класса Controller
-        $this->middleware('auth')->except(['index', 'create', 'show', 'search']);
+        $query = Article::with(['user', 'comments', 'ratings'])
+            ->where('status', 'published');
+
+        // Поиск по названию, ключ.словам и авторам
+        if ($request->has('search')) {
+            $search = $request->input('search');
+            $query->where(function ($q) use ($search) {
+                $q->where('title', 'like', "%{$search}%")
+                    ->orWhere('keywords', 'like', "%{$search}%")
+                    ->orWhereHas('user', function ($q) use ($search) {
+                        $q->where('name', 'like', "%{$search}%");
+                    });
+            });
+        }
+
+        $articles = $query->latest()->paginate(9);
+
+        // Сохранение параметра в поиске, чтобы пагинация не пропадала
+        $articles->appends(['search' => $request->search]);
+
+        $articles->getCollection()->transform(function ($article) {
+            $article->average_rating = $article->average_rating;
+            return $article;
+        });
+
+
+        return Inertia::render('Articles/Index', [
+            'articles' => $articles,
+            'filters' => $request->only(['search'])
+        ]);
     }
 
-    public function index()
+    // Главная страница
+    public function welcome()
     {
-        $articles = Article::published()->with('user')->latest()->paginate(10);
-        return view('articles.index', compact('articles'));
-    }
-
-    public function search(Request $request)
-    {
-        $search = $request->input('search');
-        $articles = Article::published()
-            ->search($search)
-            ->with('user')
+        $sampleArticles = Article::with(['user', 'comments', 'ratings'])
+            ->where('status', 'published')
             ->latest()
-            ->paginate(10);
-        
-        return view('articles.index', compact('articles', 'search'));
+            ->take(3)
+            ->get()
+            ->map(function ($article) {
+                $article->keywords = explode(',', $article->keywords);
+                $article->average_rating = $article->getAverageRatingAttribute(); // метод в модели Article
+                return $article;
+            });
+
+        return Inertia::render('Welcome', [
+            'sampleArticles' => $sampleArticles
+        ]);
     }
 
     public function create()
     {
-        // Используем метод authorize из трейта AuthorizesRequests
-        // $this->authorize('create', Article::class);
-        return view('articles.create');
+        return Inertia::render('Articles/Create');
     }
 
     public function store(Request $request)
     {
-        $this->authorize('create', Article::class);
-        
         $validated = $request->validate([
-            'title' => 'required|max:255',
-            'abstract' => 'required',
-            'keywords' => 'required',
-            'content' => 'required',
-            'status' => 'required|in:draft,under_review',
+            'title' => 'required|string|max:255',
+            'abstract' => 'required|string',
+            'keywords' => 'required|string',
+            'content' => 'required|string',
+            'references' => 'required|string',
         ]);
 
-        // Используем метод articles() из модели User
-        $article = Auth::user()->articles()->create($validated);
-        
-        return redirect()->route('articles.show', $article)
-            ->with('success', 'Статья успешно создана.');
+        $article = new Article();
+        $article->title = $validated['title'];
+        $article->abstract = $validated['abstract'];
+        $article->keywords = $validated['keywords'];
+        $article->content = $validated['content'];
+        $article->references = $validated['references'] ?? null;
+        $article->status = 'draft';
+        $article->user_id = Auth::id();
+        $article->save();
+
+        return redirect()->route('articles.show', $article->id);
     }
+
 
     public function show(Article $article)
     {
-        if ($article->status !== 'published' && 
-            (Auth::guest() || (Auth::id() !== $article->user_id && !Auth::user()->isAdmin()))) {
-            abort(403);
-        }
+        $article->load(['user', 'comments.user', 'ratings']);
 
-        $article->load(['user', 'comments.user']);
-        $userRating = null;
-        
-        if (Auth::check()) {
-            $userRating = $article->ratings()->where('user_id', Auth::id())->first();
-        }
-        
-        return view('articles.show', compact('article', 'userRating'));
+        // Вычисление средней оценки
+        $averageRating = $article->ratings->avg('rating');
+        $article->average_rating = $averageRating ? (float)$averageRating : null;
+
+        return Inertia::render('Articles/Show', [
+            'article' => $article,
+            'canEdit' => Auth::id() === $article->user_id || (Auth::check() && Auth::user()->role === 'admin'),
+            'canDestroy' => Auth::id() === $article->user_id || (Auth::check() && Auth::user()->role === 'admin')
+        ]);
     }
 
     public function edit(Article $article)
     {
-        $this->authorize('update', $article);
-        return view('articles.edit', compact('article'));
+        if (Auth::id() !== $article->user_id && Auth::user()->role !== 'admin') {
+            abort(403);
+        }
+
+        return Inertia::render('Articles/Edit', [
+            'article' => $article
+        ]);
     }
 
     public function update(Request $request, Article $article)
     {
-        $this->authorize('update', $article);
-        
+        if (Auth::id() !== $article->user_id && Auth::user()->role !== 'admin') {
+            abort(403);
+        }
+
         $validated = $request->validate([
-            'title' => 'required|max:255',
-            'abstract' => 'required',
-            'keywords' => 'required',
-            'content' => 'required',
-            'status' => 'required|in:draft,under_review',
+            'title' => 'required|string|max:255',
+            'abstract' => 'required|string',
+            'keywords' => 'required|string',
+            'content' => 'required|string',
+            'references' => 'required|string',
         ]);
 
-        $article->update($validated);
-        
-        return redirect()->route('articles.show', $article)
-            ->with('success', 'Статья успешно обновлена.');
+        $article->title = $validated['title'];
+        $article->abstract = $validated['abstract'];
+        $article->keywords = $validated['keywords'];
+        $article->content = $validated['content'];
+        $article->references = $validated['references'];
+        $article->save();
+
+        return redirect()->route('articles.show', $article->id);
     }
 
     public function destroy(Article $article)
     {
-        $this->authorize('delete', $article);
-        
+        if (Auth::id() !== $article->user_id && Auth::user()->role !== 'admin') {
+            abort(403);
+        }
+
         $article->delete();
-        
-        return redirect()->route('articles.index')
-            ->with('success', 'Статья успешно удалена.');
+
+        return redirect()->route('articles.user');
     }
 
-    public function myArticles()
-    {
-        $articles = Auth::user()->articles()->latest()->paginate(10);
-        return view('articles.my-articles', compact('articles'));
-    }
 
-    // Методы администратора
-    public function adminIndex()
-    {
-        $this->authorize('viewAny', Article::class);
-        
-        $articles = Article::with('user')->latest()->paginate(10);
-        return view('admin.articles.index', compact('articles'));
-    }
+    // public function topArticles()
+    // {
+    //     $articles = Article::with(['user', 'comments', 'ratings'])
+    //         ->where('status', 'published')
+    //         ->withAvg('ratings', 'rating')
+    //         ->orderByDesc('ratings_avg_rating')
+    //         ->take(9)
+    //         ->get();
 
-    public function updateStatus(Request $request, Article $article)
+    //     return Inertia::render('Articles/TopArticles', [
+    //         'articles' => $articles
+    //     ]);
+    // }
+
+
+    // Статьи пользователя
+    public function userArticles()
     {
-        $this->authorize('updateStatus', $article);
-        
-        $validated = $request->validate([
-            'status' => 'required|in:draft,under_review,rejected,published',
+        $articles = Article::with(['comments', 'ratings'])
+            ->where('user_id', Auth::id())
+            ->latest()
+            ->get();
+
+        return Inertia::render('Articles/UserArticles', [
+            'articles' => $articles
         ]);
+    }
 
-        $article->update($validated);
-        
-        return redirect()->back()->with('success', 'Статус статьи успешно обновлен.');
+    // Отправка на проверку
+    public function submitForReview(Article $article)
+    {
+        if (Auth::id() !== $article->user_id) {
+            abort(403);
+        }
+
+        if ($article->status !== 'draft') {
+            abort(400, 'Можно отправлять только черновики');
+        }
+
+        $article->status = 'under_review';
+        $article->save();
+
+        return redirect()->route('articles.show', $article->id);
+    }
+
+    // Одобрение статьи
+    public function approve(Article $article)
+    {
+        if (Auth::user()->role !== 'admin') {
+            abort(403);
+        }
+
+        $article->status = 'published';
+        $article->save();
+
+        return redirect()->route('articles.show', $article->id);
+    }
+
+    // Отклонение статьи
+    public function reject(Article $article)
+    {
+        if (Auth::user()->role !== 'admin') {
+            abort(403);
+        }
+
+        $article->status = 'rejected';
+        $article->save();
+
+        return redirect()->route('articles.show', $article->id);
     }
 }
